@@ -1,59 +1,94 @@
-// recipes.js — the menu: ingredients, their prep states, and the dishes.
-(function () {
-  // Every ingredient: id, label, base colour, prep the chef must do.
-  // prep: 'none' (ready), 'chop' (needs the board), 'grill' (needs the grill).
-  var INGREDIENTS = {
-    bun:     { id: 'bun',     label: 'Roti',   color: '#e8a94e', prep: 'none' },
-    patty:   { id: 'patty',   label: 'Patty',  color: '#8a5a3b', prep: 'grill' },
-    lettuce: { id: 'lettuce', label: 'Selada', color: '#7dc242', prep: 'chop' },
-    tomato:  { id: 'tomato',  label: 'Tomat',  color: '#e84c3d', prep: 'chop' },
-    cheese:  { id: 'cheese',  label: 'Keju',   color: '#ffc93c', prep: 'none' },
-    onion:   { id: 'onion',   label: 'Bawang', color: '#c9a0dc', prep: 'chop' }
-  };
-  var ORDER = ['bun', 'patty', 'lettuce', 'tomato', 'cheese', 'onion'];
+// recipes.js — the three Korean dishes of DAPUR KILAT v2.
+// Each dish is a lesson chain: a fixed sequence of tactile steps.
+// Dishes unlock one by one, like a lesson book: serve Kimchi 3 times
+// to unlock Bibimbap, serve Bibimbap 3 times to unlock Tteokbokki.
 
-  // A dish is a set of ready ingredients. The stack order on the plate is
-  // bun first, then the rest in the order the chef adds them.
-  var RECIPES = [
-    { id: 'classic', name: 'Klasik',   price: 10, needs: ['bun', 'patty', 'lettuce'] },
-    { id: 'cheese',  name: 'Keju Leleh', price: 12, needs: ['bun', 'patty', 'cheese'] },
-    { id: 'garden',  name: 'Kebun',    price: 14, needs: ['bun', 'lettuce', 'tomato', 'onion'] },
-    { id: 'deluxe',  name: 'Deluxe',   price: 18, needs: ['bun', 'patty', 'cheese', 'lettuce', 'tomato'] }
-  ];
+export const DISHES = {
+  kimchi: {
+    id: 'kimchi',
+    name: 'Kimchi',
+    img: 'assets/kimchi-bowl.jpg',
+    color: '#e8501e',
+    price: 18,
+    unlock: null, // open from the start
+    unlockText: '',
+    ingredients: [
+      { id: 'sawi', name: 'Sawi', color: '#7ec850', kind: 'leaf' },
+      { id: 'bawang', name: 'Bawang', color: '#f2e6c9', kind: 'onion' },
+      { id: 'jahe', name: 'Jahe', color: '#e8b96a', kind: 'root' },
+      { id: 'wortel', name: 'Wortel', color: '#ff7f2a', kind: 'carrot' },
+      { id: 'cabai', name: 'Cabai', color: '#d92626', kind: 'chili' },
+    ],
+    steps: ['collect', 'chop', 'pour', 'stir', 'grate', 'assemble'],
+    chopTarget: 'sawi',
+    chopLabel: 'Potong sawinya!',
+    pourLabel: 'Tuang airnya!',
+    grateTarget: 'wortel',
+    grateTool: 'lebar',
+    grateLabel: 'Parut wortelnya!',
+  },
+  bibimbap: {
+    id: 'bibimbap',
+    name: 'Bibimbap',
+    img: 'assets/bibimbap-bowl.jpg',
+    color: '#c94f6d',
+    price: 24,
+    unlock: { dish: 'kimchi', count: 3 },
+    unlockText: 'Sajikan Kimchi 3x untuk buka',
+    ingredients: [
+      { id: 'nasi', name: 'Nasi', color: '#fff6e0', kind: 'bowl' },
+      { id: 'telur', name: 'Telur', color: '#ffd94d', kind: 'egg' },
+      { id: 'wortel', name: 'Wortel', color: '#ff7f2a', kind: 'carrot' },
+      { id: 'bayam', name: 'Bayam', color: '#3da53d', kind: 'leaf' },
+      { id: 'saus', name: 'Saus', color: '#c0392b', kind: 'sauce' },
+    ],
+    steps: ['collect', 'chop', 'pour', 'stir', 'assemble'],
+    chopTarget: 'wortel',
+    chopLabel: 'Potong wortelnya!',
+    pourLabel: 'Tuang sausnya!',
+    grateTarget: null,
+    grateTool: null,
+    grateLabel: '',
+  },
+  tteokbokki: {
+    id: 'tteokbokki',
+    name: 'Tteokbokki',
+    img: 'assets/tteokbokki-plate.jpg',
+    color: '#d92626',
+    price: 30,
+    unlock: { dish: 'bibimbap', count: 3 },
+    unlockText: 'Sajikan Bibimbap 3x untuk buka',
+    ingredients: [
+      { id: 'tteok', name: 'Tteok', color: '#fff1d6', kind: 'cake' },
+      { id: 'saus', name: 'Saus Pedas', color: '#c0392b', kind: 'sauce' },
+      { id: 'daunbawang', name: 'Daun Bawang', color: '#4caf50', kind: 'leaf' },
+      { id: 'keju', name: 'Keju', color: '#ffcf3f', kind: 'cheese' },
+    ],
+    steps: ['collect', 'pour', 'stir', 'grate', 'assemble'],
+    chopTarget: null,
+    chopLabel: '',
+    pourLabel: 'Tuang saus pedasnya!',
+    grateTarget: 'keju',
+    grateTool: 'halus',
+    grateLabel: 'Parut kejunya!',
+  },
+};
 
-  function ingredientNeeds(ingId) { return INGREDIENTS[ingId].prep; }
-  function ingredientLabel(ingId) { return INGREDIENTS[ingId].label; }
-  function ingredientColor(ingId) { return INGREDIENTS[ingId].color; }
+export const DISH_ORDER = ['kimchi', 'bibimbap', 'tteokbokki'];
 
-  // Does the plate's ready-ingredient set equal this recipe exactly?
-  function plateMatchesRecipe(plate, recipe) {
-    if (plate.length !== recipe.needs.length) return false;
-    var have = plate.slice().sort().join(',');
-    return have === recipe.needs.slice().sort().join(',');
-  }
-  function findRecipeForPlate(plate) {
-    for (var i = 0; i < RECIPES.length; i++) {
-      if (plateMatchesRecipe(plate, RECIPES[i])) return RECIPES[i];
-    }
-    return null;
-  }
-  // Could this plate still become some recipe (used for the "wrong mix" hint)?
-  function plateCouldBecome(plate) {
-    for (var i = 0; i < RECIPES.length; i++) {
-      var r = RECIPES[i];
-      if (plate.length > r.needs.length) continue;
-      var ok = plate.every(function (p) { return r.needs.indexOf(p) !== -1; });
-      if (ok) return true;
-    }
-    return false;
-  }
-  function randomRecipe() { return RECIPES[Math.floor(Math.random() * RECIPES.length)]; }
+// The three graters on the grate panel. Only one is right per ingredient.
+export const GRATERS = [
+  { id: 'halus', name: 'Halus', desc: 'lubang kecil' },
+  { id: 'lebar', name: 'Lebar', desc: 'slot lebar' },
+  { id: 'sedang', name: 'Sedang', desc: 'gigi sedang' },
+];
 
-  window.Recipes = {
-    INGREDIENTS: INGREDIENTS, ORDER: ORDER, RECIPES: RECIPES,
-    ingredientNeeds: ingredientNeeds, ingredientLabel: ingredientLabel,
-    ingredientColor: ingredientColor, plateMatchesRecipe: plateMatchesRecipe,
-    findRecipeForPlate: findRecipeForPlate, plateCouldBecome: plateCouldBecome,
-    randomRecipe: randomRecipe
-  };
-})();
+export function isUnlocked(dishId, served) {
+  const d = DISHES[dishId];
+  if (!d.unlock) return true;
+  return (served[d.unlock.dish] || 0) >= d.unlock.count;
+}
+
+export function unlockedDishes(served) {
+  return DISH_ORDER.filter((id) => isUnlocked(id, served));
+}

@@ -1,582 +1,299 @@
-// main.js — Dapur Kilat: game loop, states, input, and all on-screen drawing.
-(function () {
-  var W = 1280, H = 720;
-  var canvas = document.getElementById('game');
-  var ctx = canvas.getContext('2d');
+// main.js — game loop, state machine and input routing for
+// DAPUR KILAT v2. Modes: title → kitchen → step (lesson chain)
+// → kitchen (plate on the pass) → gameover at the end of the shift.
 
-  var game = {
-    state: 'title', // title | playing | paused | over
-    elapsed: 0,
-    shiftLen: 120,
-    frozen: false,
-    board: new Orders.OrderBoard(),
-    kitchen: new Kitchen.Kitchen(),
-    keys: {},
-    serveFlash: null,
-    last: 0,
-    muted: false
-  };
-  game.kitchen.onServe = function (stack) {
-    var res = game.board.serve(stack);
-    if (!res.ok) return { ok: false };
-    var o = res.order;
-    var bonus = Math.round(4 * Math.max(0, o.patience / o.maxPatience));
-    game.serveFlash = { customer: o.customer, until: Date.now() + 1800, name: Customers.person(o.customer).name };
-    return { ok: true, price: o.recipe.price, bonus: bonus, order: o };
-  };
+import { loadImages, IMAGES, rr, circle } from './art.js';
+import { DISHES, DISH_ORDER } from './recipes.js';
+import { drawKitchenBg, drawOrderBoard, drawHud, drawMenuStrip, drawPass, drawChef, updateChef, W, H } from './kitchen.js';
+import { updateTickets, spawnTicket } from './orders.js';
+import { startCooking, abortCooking, updateStep, drawStepScene, stepPointerDown, stepPointerMove, stepPointerUp, stepKeyDown, servePlate } from './steps.js';
+import { sfx, ensureAudio } from './audio.js';
+import { applyShot, runSelfTest } from './shots.js';
 
-  function fmtTime(s) {
-    s = Math.max(0, Math.ceil(s));
-    var m = Math.floor(s / 60), r = s % 60;
-    return (m < 10 ? '0' : '') + m + ':' + (r < 10 ? '0' : '') + r;
-  }
+export const G = {
+  mode: 'title',
+  now: 0,
+  shiftLeft: 120,
+  coins: 0,
+  combo: 0,
+  bestCombo: 0,
+  served: { kimchi: 0, bibimbap: 0, tteokbokki: 0 },
+  servedTotal: 0,
+  stars: 0,
+  failed: 0,
+  tickets: [],
+  spawnIn: 8,
+  current: null,
+  readyPlate: null,
+  chef: { x: 640, y: 560, tx: null, ty: null, moving: false },
+  keys: new Set(),
+  popups: [],
+  banner: null,
+  unlockedShown: {},
+  lastMistakes: 0,
+  frozen: false,
+  muted: false,
+};
 
-  function startGame() {
-    game.state = 'playing';
-    game.elapsed = 0;
-    game.board = new Orders.OrderBoard();
-    game.kitchen = new Kitchen.Kitchen();
-    game.kitchen.onServe = game.kitchen.onServe || null;
-    game.kitchen.onServe = function (stack) {
-      var res = game.board.serve(stack);
-      if (!res.ok) return { ok: false };
-      var o = res.order;
-      var bonus = Math.round(4 * Math.max(0, o.patience / o.maxPatience));
-      game.serveFlash = { customer: o.customer, until: Date.now() + 1800, name: Customers.person(o.customer).name };
-      return { ok: true, price: o.recipe.price, bonus: bonus, order: o };
-    };
-    game.serveFlash = null;
-    if (window.Sfx) Sfx.unlock();
-  }
+let canvas, ctx;
 
-  function update(dt) {
-    if (game.state !== 'playing' || game.frozen) return;
-    game.elapsed += dt;
-    var evt = game.board.update(dt, game.elapsed, game.shiftLen);
-    if (evt && evt.type === 'lost') {
-      game.kitchen.combo = 0;
-      game.kitchen.showToast(Customers.person(evt.order.customer).name + ' pergi! Pesanan hangus.');
-    }
-    // moving away stops chopping
-    if (game.kitchen.chop.active && (game.keys.left || game.keys.right || game.keys.up || game.keys.down)) {
-      game.kitchen.stopChop();
-    }
-    game.kitchen.update(dt, game.keys, Date.now());
-    if (game.elapsed >= game.shiftLen) {
-      game.state = 'over';
-      if (window.Sfx) Sfx.win();
-    }
-  }
+function resetGame() {
+  G.mode = 'kitchen';
+  G.shiftLeft = 120;
+  G.coins = 0;
+  G.combo = 0;
+  G.bestCombo = 0;
+  G.served = { kimchi: 0, bibimbap: 0, tteokbokki: 0 };
+  G.servedTotal = 0;
+  G.stars = 0;
+  G.failed = 0;
+  G.tickets = [];
+  G.spawnIn = 8;
+  G.current = null;
+  G.readyPlate = null;
+  G.chef = { x: 640, y: 560, tx: null, ty: null, moving: false };
+  G.popups = [];
+  G.banner = null;
+  G.unlockedShown = {};
+  spawnTicket(G, 0);
+  spawnTicket(G, 0);
+}
 
-  // ---------- input ----------
-  var KEYMAP = { ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right', ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down' };
-  window.addEventListener('keydown', function (e) {
-    if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space'].indexOf(e.code) !== -1) e.preventDefault();
-    if (game.state === 'title' && (e.code === 'Enter' || e.code === 'Space')) { startGame(); return; }
-    if (game.state === 'over' && (e.code === 'Enter' || e.code === 'KeyR')) { startGame(); return; }
-    if (e.code === 'KeyP' && (game.state === 'playing' || game.state === 'paused')) {
-      game.state = game.state === 'playing' ? 'paused' : 'playing';
-      return;
-    }
-    if (e.code === 'KeyM') { game.muted = Sfx.toggleMute(); return; }
-    if (KEYMAP[e.code]) game.keys[KEYMAP[e.code]] = true;
-    if (game.state === 'playing' && (e.code === 'KeyE' || e.code === 'Space')) {
-      var st = game.kitchen.nearestStation();
-      if (st) game.kitchen.interact(st, Date.now());
-    }
-    if (game.state === 'playing' && /^Digit[1-6]$/.test(e.code)) {
-      var idx = parseInt(e.code.slice(5), 10) - 1;
-      var ing = Recipes.ORDER[idx];
-      var near = game.kitchen.nearestStation();
-      if (near && near.id === 'crates' && !game.kitchen.carrying) {
-        game.kitchen.interact({ id: 'crates', bin: ing }, Date.now());
-      }
-    }
-  });
-  window.addEventListener('keyup', function (e) {
-    if (KEYMAP[e.code]) game.keys[KEYMAP[e.code]] = false;
-  });
-  canvas.addEventListener('mousedown', function (e) {
-    if (window.Sfx) Sfx.unlock();
-    if (game.state === 'title') { startGame(); return; }
-    if (game.state === 'over') return;
-    if (game.state === 'paused') { game.state = 'playing'; return; }
-    var r = canvas.getBoundingClientRect();
-    var wx = (e.clientX - r.left) * (W / r.width);
-    var wy = (e.clientY - r.top) * (H / r.height);
-    game.kitchen.clickAt(wx, wy);
-  });
-
-  // ---------- drawing ----------
-  function drawBackground() {
-    var bg = Art.img('bg');
-    if (bg && bg.naturalWidth) ctx.drawImage(bg, 0, 0, W, H);
-    else { ctx.fillStyle = '#f7e8c9'; ctx.fillRect(0, 0, W, H); }
-    // clean wooden counter over the painted one, so stations read clearly
-    ctx.fillStyle = '#a9713f';
-    ctx.fillRect(0, 428, W, 172);
-    ctx.fillStyle = '#8a5a2e';
-    ctx.fillRect(0, 428, W, 8);
-    ctx.fillStyle = '#c08a52';
-    ctx.fillRect(0, 596, W, 6);
-    // floor
-    ctx.fillStyle = '#6e4a2f';
-    ctx.fillRect(0, 602, W, H - 602);
-    ctx.fillStyle = '#7d5638';
-    for (var x = 0; x < W; x += 160) ctx.fillRect(x, 602, 4, H - 602);
-  }
-
-  function drawOrderBoard() {
-    ctx.fillStyle = 'rgba(255,248,230,0.96)';
-    ctx.fillRect(0, 0, W, 96);
-    ctx.fillStyle = '#8a5a2e';
-    ctx.fillRect(0, 96, W, 4);
-    var tickets = game.board.tickets;
-    if (tickets.length === 0) {
-      ctx.fillStyle = '#8a6d4b';
-      ctx.font = 'italic 20px "Trebuchet MS", sans-serif';
-      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-      ctx.fillText('Pesanan masuk sebentar lagi…', 24, 48);
-    }
-    tickets.forEach(function (o, i) {
-      var x = 16 + i * 218;
-      var y = 8, w = 206, h = 80;
-      var frac = Math.max(0, o.patience / o.maxPatience);
-      var urgent = o.patience < 10;
-      var flashOn = urgent && Math.floor(Date.now() / 300) % 2 === 0;
-      ctx.save();
-      if (game.kitchen.shakeT > 0 && i === 0) ctx.translate(Math.sin(Date.now() / 30) * 3, 0);
-      ctx.fillStyle = flashOn ? '#ffe1de' : '#fffdf6';
-      Art.rr(ctx, x, y, w, h, 10); ctx.fill();
-      ctx.lineWidth = urgent ? 3.5 : 2;
-      ctx.strokeStyle = urgent ? '#e74c3c' : '#d9c9a8';
-      Art.rr(ctx, x, y, w, h, 10); ctx.stroke();
-      Customers.drawPortrait(ctx, o.customer, x + 30, y + 30, 24, frac, false);
-      ctx.fillStyle = '#3a2a1a';
-      ctx.font = 'bold 16px "Trebuchet MS", sans-serif';
-      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-      ctx.fillText(o.recipe.name + '  ·  $' + o.recipe.price, x + 62, y + 18);
-      // recipe icons
-      o.recipe.needs.forEach(function (ing, j) {
-        Art.drawIngredient(ctx, ing, x + 76 + j * 30, y + 46, 24);
-      });
-      // patience bar
-      ctx.fillStyle = '#e8dcc4';
-      Art.rr(ctx, x + 62, y + 66, 132, 8, 4); ctx.fill();
-      ctx.fillStyle = frac > 0.5 ? '#2ecc71' : frac > 0.25 ? '#f39c12' : '#e74c3c';
-      if (frac > 0) { Art.rr(ctx, x + 62, y + 66, 132 * frac, 8, 4); ctx.fill(); }
-      if (urgent) {
-        ctx.fillStyle = '#e74c3c';
-        ctx.font = 'bold 15px "Trebuchet MS", sans-serif';
-        ctx.textAlign = 'right';
-        ctx.fillText(Math.ceil(o.patience) + 's!', x + w - 8, y + 16);
-      }
-      ctx.restore();
-    });
-  }
-
-  function drawHud() {
-    // coins (left, under the board)
-    ctx.fillStyle = 'rgba(43,26,18,0.85)';
-    Art.rr(ctx, 16, 108, 150, 40, 20); ctx.fill();
-    ctx.fillStyle = '#ffd93c';
-    ctx.beginPath(); ctx.arc(38, 128, 13, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#b8860b';
-    ctx.font = 'bold 16px "Trebuchet MS", sans-serif';
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText('$', 38, 129);
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 22px "Trebuchet MS", sans-serif';
-    ctx.textAlign = 'left';
-    ctx.fillText('$' + game.kitchen.coins, 58, 129);
-    // shift timer (centre, big, colour-shifting)
-    var remain = game.shiftLen - game.elapsed;
-    var tcol = remain > 60 ? '#2ecc71' : remain > 30 ? '#f39c12' : '#e74c3c';
-    ctx.fillStyle = 'rgba(43,26,18,0.85)';
-    Art.rr(ctx, W / 2 - 110, 108, 220, 44, 22); ctx.fill();
-    ctx.fillStyle = tcol;
-    ctx.font = 'bold 28px "Trebuchet MS", sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('WAKTU ' + fmtTime(remain), W / 2, 131);
-    // combo (right)
-    if (game.kitchen.combo >= 2) {
-      ctx.fillStyle = 'rgba(43,26,18,0.85)';
-      Art.rr(ctx, W - 176, 108, 160, 40, 20); ctx.fill();
-      ctx.fillStyle = '#ff8c1a';
-      ctx.font = 'bold 22px "Trebuchet MS", sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText('COMBO x' + game.kitchen.combo, W - 96, 129);
-    }
-    if (game.muted) {
-      ctx.fillStyle = 'rgba(43,26,18,0.85)';
-      Art.rr(ctx, W - 220, 108, 36, 40, 10); ctx.fill();
-      ctx.fillStyle = '#fff'; ctx.font = 'bold 15px sans-serif';
-      ctx.textAlign = 'center'; ctx.fillText('MUTE', W - 202, 129);
-    }
-  }
-
-  function drawStations() {
-    var K = game.kitchen;
-    var S = Kitchen.STATIONS;
-    var near = K.nearestStation();
-    function label(s, text) {
-      ctx.fillStyle = 'rgba(43,26,18,0.8)';
-      Art.rr(ctx, s.x - 52, s.y - 34, 104, 24, 12); ctx.fill();
-      ctx.fillStyle = '#ffe9b8';
-      ctx.font = 'bold 14px "Trebuchet MS", sans-serif';
-      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(text, s.x, s.y - 21);
-      if (near && near.id === s.id && game.state === 'playing') {
-        ctx.strokeStyle = '#ffd93c'; ctx.lineWidth = 3;
-        ctx.beginPath(); ctx.arc(s.x, s.y + 40, 62, 0, Math.PI * 2); ctx.stroke();
-      }
-    }
-    // crates: six bins
-    Kitchen.crateBins().forEach(function (b, i) {
-      ctx.fillStyle = '#7a4a22';
-      Art.rr(ctx, b.x - 46, b.y - 30, 92, 60, 8); ctx.fill();
-      ctx.fillStyle = '#9c6633';
-      Art.rr(ctx, b.x - 42, b.y - 26, 84, 52, 6); ctx.fill();
-      Art.drawIngredient(ctx, b.id, b.x, b.y - 2, 46);
-      ctx.fillStyle = 'rgba(43,26,18,0.75)';
-      ctx.beginPath(); ctx.arc(b.x - 36, b.y - 22, 10, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = '#fff'; ctx.font = 'bold 12px sans-serif';
-      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(String(i + 1), b.x - 36, b.y - 21);
-      ctx.fillStyle = '#ffe9b8'; ctx.font = 'bold 11px "Trebuchet MS", sans-serif';
-      ctx.fillText(Recipes.ingredientLabel(b.id), b.x, b.y + 40);
-    });
-    // crates label sits above the bins so it never covers an ingredient
-    ctx.fillStyle = 'rgba(43,26,18,0.8)';
-    Art.rr(ctx, S.crates.x - 52, 402, 104, 24, 12); ctx.fill();
-    ctx.fillStyle = '#ffe9b8';
-    ctx.font = 'bold 14px "Trebuchet MS", sans-serif';
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText('BAHAN  (1–6)', S.crates.x, 415);
-    // chopping board
-    ctx.fillStyle = '#d9a866';
-    Art.rr(ctx, S.board.x - 78, 500, 156, 58, 10); ctx.fill();
-    ctx.fillStyle = '#b9834a';
-    Art.rr(ctx, S.board.x - 78, 548, 156, 10, 5); ctx.fill();
-    if (K.chop.item) {
-      Art.drawIngredient(ctx, K.chop.item, S.board.x, 526, 52);
-      var pr = K.chop.progress;
-      ctx.lineWidth = 7;
-      ctx.strokeStyle = 'rgba(0,0,0,0.25)';
-      ctx.beginPath(); ctx.arc(S.board.x, 526, 40, 0, Math.PI * 2); ctx.stroke();
-      ctx.strokeStyle = '#2ecc71';
-      ctx.beginPath(); ctx.arc(S.board.x, 526, 40, -Math.PI / 2, -Math.PI / 2 + pr * Math.PI * 2); ctx.stroke();
-      ctx.fillStyle = 'rgba(44,74,18,0.9)';
-      Art.rr(ctx, S.board.x - 42, 470, 84, 22, 11); ctx.fill();
-      ctx.fillStyle = '#fff'; ctx.font = 'bold 13px sans-serif';
-      ctx.textAlign = 'center'; ctx.fillText('POTONG…', S.board.x, 482);
-    }
-    label(S.board, 'TALENAN  (tahan E)');
-    // grill
-    ctx.fillStyle = '#3a3a3a';
-    Art.rr(ctx, S.grill.x - 86, 498, 172, 60, 10); ctx.fill();
-    ctx.strokeStyle = '#666'; ctx.lineWidth = 3;
-    for (var g = 0; g < 6; g++) {
-      ctx.beginPath(); ctx.moveTo(S.grill.x - 78, 508 + g * 8); ctx.lineTo(S.grill.x + 78, 508 + g * 8); ctx.stroke();
-    }
-    if (K.grill.item) {
-      var col = K.grill.burnt ? '#222' : K.grill.done ? '#a4714e' : '#8a5a3b';
-      ctx.fillStyle = col;
-      Art.rr(ctx, S.grill.x - 40, 512, 80, 26, 12); ctx.fill();
-      var frac = K.grill.burnt ? 1 : Math.min(1, K.grill.timer / 4);
-      ctx.lineWidth = 7;
-      ctx.strokeStyle = 'rgba(0,0,0,0.3)';
-      ctx.beginPath(); ctx.arc(S.grill.x, 525, 44, 0, Math.PI * 2); ctx.stroke();
-      ctx.strokeStyle = K.grill.burnt ? '#e74c3c' : K.grill.done ? '#2ecc71' : '#f39c12';
-      ctx.beginPath(); ctx.arc(S.grill.x, 525, 44, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2); ctx.stroke();
-      ctx.fillStyle = K.grill.burnt ? '#e74c3c' : '#fff';
-      ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center';
-      ctx.fillText(K.grill.burnt ? 'HANGUS!' : K.grill.done ? 'MATANG!' : 'GRILL…', S.grill.x, 578);
-    }
-    label(S.grill, 'GRILL');
-    // assembly counter: the dish mid-assembly
-    ctx.fillStyle = '#e8dcc4';
-    Art.rr(ctx, S.assembly.x - 88, 500, 176, 58, 10); ctx.fill();
-    if (K.plate.length > 0) {
-      Art.drawPlate(ctx, S.assembly.x, 528, K.plate, 1);
-      var done = Recipes.findRecipeForPlate(K.plate);
-      if (done) {
-        ctx.strokeStyle = '#2ecc71'; ctx.lineWidth = 4;
-        ctx.beginPath(); ctx.arc(S.assembly.x, 528, 56, 0, Math.PI * 2); ctx.stroke();
-        var label2 = done.name.toUpperCase() + ' SIAP!';
-        ctx.font = 'bold 15px sans-serif';
-        var lw = ctx.measureText(label2).width + 20;
-        ctx.fillStyle = 'rgba(46,204,113,0.95)';
-        Art.rr(ctx, S.assembly.x - lw / 2, 584, lw, 24, 12); ctx.fill();
-        ctx.fillStyle = '#fff'; ctx.textAlign = 'center';
-        ctx.fillText(label2, S.assembly.x, 597);
-      }
-    } else {
-      ctx.fillStyle = '#b9a888'; ctx.font = 'italic 14px sans-serif'; ctx.textAlign = 'center';
-      ctx.fillText('piring kosong', S.assembly.x, 532);
-    }
-    label(S.assembly, 'RAKIT BURGER');
-    // serving pass
-    ctx.fillStyle = '#fff6e0';
-    Art.rr(ctx, S.pass.x - 82, 478, 164, 80, 10); ctx.fill();
-    ctx.strokeStyle = '#d9b25a'; ctx.lineWidth = 3;
-    Art.rr(ctx, S.pass.x - 82, 478, 164, 80, 10); ctx.stroke();
-    ctx.fillStyle = '#c9a227';
-    ctx.beginPath(); ctx.arc(S.pass.x, 508, 16, Math.PI, 0); ctx.fill();
-    ctx.fillRect(S.pass.x - 20, 508, 40, 5);
-    ctx.fillStyle = '#8a6d4b'; ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center';
-    ctx.fillText('SAJIKAN DI SINI', S.pass.x, 544);
-    label(S.pass, 'PASS  (E)');
-    // trash
-    var T = S.trash;
-    ctx.fillStyle = '#5a5a5a';
-    Art.rr(ctx, T.x - 22, 596, 44, 52, 6); ctx.fill();
-    ctx.fillStyle = '#777';
-    Art.rr(ctx, T.x - 26, 590, 52, 10, 4); ctx.fill();
-    ctx.fillStyle = '#fff'; ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'center';
-    ctx.fillText('SAMPAH', T.x, 660);
-  }
-
-  function drawChefAndEffects() {
-    var K = game.kitchen;
-    var c = K.chef;
-    // hint bubble when standing at a station with something to do
-    // (hidden while carrying a plate — the pass is the only thing left to do)
-    var near = K.nearestStation();
-    if (near && game.state === 'playing' && !(K.carrying && K.carrying.plate)) {
-      ctx.fillStyle = 'rgba(43,26,18,0.85)';
-      var msg = near.id === 'crates' ? 'Pilih bahan (1–6 / klik)' :
-        near.id === 'board' ? 'E: potong' :
-        near.id === 'grill' ? 'E: grill / ambil' :
-        near.id === 'assembly' ? 'E: tambah / ambil piring' :
-        near.id === 'pass' ? 'E: sajikan!' : 'E: buang';
-      ctx.font = 'bold 14px "Trebuchet MS", sans-serif';
-      var w = ctx.measureText(msg).width + 22;
-      Art.rr(ctx, c.x - w / 2, c.y - 190, w, 28, 14); ctx.fill();
-      ctx.fillStyle = '#ffe9b8'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(msg, c.x, c.y - 175);
-    }
-    var carrying = null;
-    if (K.carrying) {
-      carrying = K.carrying.plate ? 'plate' : K.carrying.kind;
-    }
-    if (carrying === 'plate') {
-      Art.drawChef(ctx, c.x, c.y, c.dir, c.walking, null);
-      Art.drawPlate(ctx, c.x + 34 * c.dir, c.y - 108, K.carrying.stack, 0.85);
-    } else {
-      Art.drawChef(ctx, c.x, c.y, c.dir, c.walking, carrying);
-    }
-    // particles
-    K.particles.forEach(function (p) {
-      ctx.globalAlpha = Math.max(0, p.life / p.max);
-      ctx.fillStyle = p.color;
-      ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2); ctx.fill();
-    });
-    ctx.globalAlpha = 1;
-    // popups
-    K.popups.forEach(function (pp) {
-      ctx.globalAlpha = Math.max(0, Math.min(1, pp.life));
-      ctx.fillStyle = pp.color;
-      ctx.font = 'bold 26px "Trebuchet MS", sans-serif';
-      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.strokeStyle = 'rgba(0,0,0,0.5)'; ctx.lineWidth = 4;
-      ctx.strokeText(pp.text, pp.x, pp.y);
-      ctx.fillText(pp.text, pp.x, pp.y);
-    });
-    ctx.globalAlpha = 1;
-    // toast
-    if (K.toast && Date.now() < K.toast.until) {
-      ctx.fillStyle = 'rgba(43,26,18,0.9)';
-      ctx.font = 'bold 17px "Trebuchet MS", sans-serif';
-      var tw = ctx.measureText(K.toast.text).width + 30;
-      Art.rr(ctx, W / 2 - tw / 2, 668, tw, 34, 17); ctx.fill();
-      ctx.fillStyle = '#ffe9b8'; ctx.textAlign = 'center';
-      ctx.fillText(K.toast.text, W / 2, 686);
-    }
-  }
-
-  function drawServeFlash() {
-    if (!game.serveFlash || Date.now() > game.serveFlash.until) { game.serveFlash = null; return; }
-    var f = game.serveFlash;
+function drawTitle(now) {
+  ctx.save();
+  drawKitchenBg(ctx);
+  ctx.fillStyle = 'rgba(58,42,24,0.55)';
+  ctx.fillRect(0, 0, W, H);
+  // hero dish photo
+  if (IMAGES.dishHero) {
     ctx.save();
-    ctx.fillStyle = 'rgba(255,248,230,0.95)';
-    Art.rr(ctx, W - 330, 160, 300, 96, 14); ctx.fill();
-    ctx.strokeStyle = '#2ecc71'; ctx.lineWidth = 3;
-    Art.rr(ctx, W - 330, 160, 300, 96, 14); ctx.stroke();
-    Customers.drawPortrait(ctx, f.customer, W - 288, 208, 34, 1, true);
-    ctx.fillStyle = '#2c7a3d';
-    ctx.font = 'bold 20px "Trebuchet MS", sans-serif';
-    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-    ctx.fillText(f.name + ' senang!', W - 240, 196);
-    ctx.fillStyle = '#5a4632'; ctx.font = '16px "Trebuchet MS", sans-serif';
-    ctx.fillText('“Enak banget, makasih!”', W - 240, 222);
+    rr(ctx, 440, 90, 400, 240, 18);
+    ctx.clip();
+    ctx.drawImage(IMAGES.dishHero, 440, 90, 400, 240);
     ctx.restore();
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = '#fff';
+    rr(ctx, 440, 90, 400, 240, 18);
+    ctx.stroke();
   }
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 64px system-ui, sans-serif';
+  ctx.fillText('DAPUR KILAT', 640, 400);
+  ctx.fillStyle = '#ffd94d';
+  ctx.font = 'bold 30px system-ui, sans-serif';
+  ctx.fillText('— Pelajaran Korea —', 640, 446);
+  ctx.fillStyle = '#fff';
+  ctx.font = '18px system-ui, sans-serif';
+  ctx.fillText('Masak 3 resep Korea langkah demi langkah: kumpul, potong, tuang, aduk, parut, sajikan!', 640, 486);
+  ctx.fillText('Layani pelanggan sebelum patience mereka habis. Shift 120 detik!', 640, 512);
+  // start button
+  ctx.fillStyle = '#e8501e';
+  rr(ctx, 490, 540, 300, 70, 16);
+  ctx.fill();
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 3;
+  rr(ctx, 490, 540, 300, 70, 16);
+  ctx.stroke();
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 28px system-ui, sans-serif';
+  ctx.fillText('MULAI MEMASAK ▶', 640, 575);
+  ctx.font = '14px system-ui, sans-serif';
+  ctx.fillStyle = '#ffe9c9';
+  ctx.fillText('WASD / klik untuk jalan  •  E / klik untuk berinteraksi  •  P jeda', 640, 650);
+  ctx.restore();
+}
 
-  function drawTitle() {
-    ctx.fillStyle = 'rgba(43,26,18,0.72)';
-    ctx.fillRect(0, 0, W, H);
-    var dish = Art.img('dish');
-    if (dish && dish.naturalWidth) {
-      ctx.save();
-      ctx.beginPath(); ctx.arc(960, 300, 190, 0, Math.PI * 2); ctx.clip();
-      ctx.drawImage(dish, 770, 110, 380, 380);
-      ctx.restore();
-      ctx.strokeStyle = '#ffd93c'; ctx.lineWidth = 6;
-      ctx.beginPath(); ctx.arc(960, 300, 190, 0, Math.PI * 2); ctx.stroke();
+function drawGameOver() {
+  ctx.save();
+  ctx.fillStyle = 'rgba(58,42,24,0.7)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#fffdf5';
+  rr(ctx, 340, 130, 600, 440, 20);
+  ctx.fill();
+  ctx.strokeStyle = '#ff9f1c';
+  ctx.lineWidth = 4;
+  rr(ctx, 340, 130, 600, 440, 20);
+  ctx.stroke();
+  ctx.fillStyle = '#3a2a18';
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 40px system-ui, sans-serif';
+  ctx.fillText('SHIFT SELESAI!', 640, 190);
+  ctx.font = 'bold 24px system-ui, sans-serif';
+  ctx.fillStyle = '#b8860b';
+  ctx.fillText(`💰 $${G.coins}   •   🍽️ ${G.servedTotal} hidangan`, 640, 250);
+  ctx.fillStyle = '#3a2a18';
+  ctx.font = '20px system-ui, sans-serif';
+  ctx.fillText(`Bintang: ${'★'.repeat(Math.min(9, G.stars))} (${G.stars})`, 640, 300);
+  ctx.fillText(`Combo terbaik: x${G.bestCombo}   •   Pelanggan pergi: ${G.failed}`, 640, 340);
+  const unlocked = DISH_ORDER.filter((id) => (G.served[id] || 0) > 0).map((id) => DISHES[id].name).join(', ');
+  ctx.fillText(`Resep dimasak: ${unlocked || '—'}`, 640, 380);
+  ctx.fillStyle = '#2f8f2f';
+  rr(ctx, 490, 430, 300, 64, 14);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 24px system-ui, sans-serif';
+  ctx.fillText('MAIN LAGI ↻', 640, 462);
+  ctx.restore();
+}
+
+function drawPopups() {
+  ctx.save();
+  ctx.textAlign = 'center';
+  for (const p of G.popups) {
+    // remaining seconds, clamped: a popup pinned for a screenshot
+    // (until far in the future) stays put instead of flying off-screen
+    const age = Math.max(0, Math.min(1.8, (p.until - G.now) / 1000));
+    const y = p.y - (1.8 - age) * 40;
+    ctx.globalAlpha = Math.min(1, age / 0.5);
+    ctx.fillStyle = p.color || '#b8860b';
+    ctx.font = p.big ? 'bold 34px system-ui, sans-serif' : 'bold 20px system-ui, sans-serif';
+    ctx.fillText(p.text, p.x, y);
+  }
+  ctx.restore();
+}
+
+function drawBanner() {
+  if (!G.banner || G.banner.until < G.now) return;
+  ctx.save();
+  ctx.fillStyle = G.banner.color || '#2f8f2f';
+  ctx.globalAlpha = 0.95;
+  rr(ctx, 340, 160, 600, 46, 12);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 20px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(G.banner.text, 640, 183);
+  ctx.restore();
+}
+
+function draw(now) {
+  ctx.clearRect(0, 0, W, H);
+  if (G.mode === 'title') { drawTitle(now); return; }
+  if (G.mode === 'gameover') { drawKitchenBg(ctx); drawGameOver(); return; }
+  drawKitchenBg(ctx);
+  drawOrderBoard(ctx, G, now);
+  drawHud(ctx, G);
+  if (G.mode === 'kitchen') {
+    drawChef(ctx, G, now);
+    drawMenuStrip(ctx, G);
+  }
+  if (G.mode === 'kitchen' || G.readyPlate) drawPass(ctx, G, now);
+  if (G.mode === 'step') drawStepScene(ctx, G, now);
+  drawPopups();
+  drawBanner();
+}
+
+let last = 0;
+function loop(now) {
+  requestAnimationFrame(loop);
+  const dt = Math.min(0.05, (now - last) / 1000 || 0.016);
+  last = now;
+  G.now = now;
+  if (!G.frozen) {
+    if (G.mode === 'kitchen' || G.mode === 'step') {
+      G.shiftLeft -= dt;
+      updateTickets(G, dt, now);
+      if (G.mode === 'kitchen') updateChef(G, dt, G.keys);
+      if (G.mode === 'step') {
+        updateStep(G, dt);
+        // the ticket being cooked walked out → stop cooking
+        if (G.current && G.current.ticket.state === 'failed') {
+          abortCooking(G, 'Pelanggan pergi... 😢');
+        }
+      }
+      if (G.shiftLeft <= 0) {
+        G.shiftLeft = 0;
+        G.mode = 'gameover';
+        sfx.alarm();
+      }
     }
-    Art.drawCircleImage(ctx, 'chef', 120, 140, 60);
-    ctx.fillStyle = '#ffd93c';
-    ctx.font = 'bold 84px "Trebuchet MS", sans-serif';
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText('DAPUR KILAT', 480, 170);
-    ctx.fillStyle = '#fff';
-    ctx.font = 'italic 26px "Trebuchet MS", sans-serif';
-    ctx.fillText('Masak cepat, sajikan tepat waktu!', 480, 225);
-    ctx.font = '19px "Trebuchet MS", sans-serif';
-    ctx.fillStyle = '#ffe9b8';
-    ctx.textAlign = 'left';
-    var lines = [
-      'Kamu chef-nya. Pelanggan pesan burger — rakit sesuai resep sebelum mereka ngambek.',
-      'Ambil bahan (1–6), potong di talenan, grill patty, rakit di meja, sajikan di pass.',
-      'Shift 120 detik. Kombo beruntun = koin lebih banyak. Jangan sampai patty hangus!'
-    ];
-    lines.forEach(function (l, i) { ctx.fillText(l, 120, 440 + i * 30); });
-    var pulse = 0.7 + Math.sin(Date.now() / 300) * 0.3;
-    ctx.globalAlpha = pulse;
-    ctx.fillStyle = '#2ecc71';
-    Art.rr(ctx, 330, 540, 300, 56, 28); ctx.fill();
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 26px "Trebuchet MS", sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('▶  MULAI MASAK', 480, 569);
-    ctx.fillStyle = '#d8c9a8'; ctx.font = '15px sans-serif';
-    ctx.fillText('WASD / panah bergerak · E interaksi · klik untuk jalan · P jeda · M suara', 480, 630);
   }
+  G.popups = G.popups.filter((p) => p.until > now);
+  draw(now);
+}
 
-  function drawPaused() {
-    ctx.fillStyle = 'rgba(43,26,18,0.6)';
-    ctx.fillRect(0, 0, W, H);
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 52px "Trebuchet MS", sans-serif';
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText('JEDA', W / 2, H / 2 - 20);
-    ctx.font = '20px "Trebuchet MS", sans-serif';
-    ctx.fillText('Tekan P untuk lanjut', W / 2, H / 2 + 30);
+function canvasPos(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * (W / r.width), y: (e.clientY - r.top) * (H / r.height) };
+}
+
+function onPointerDown(e) {
+  ensureAudio();
+  const { x, y } = canvasPos(e);
+  if (G.mode === 'title') {
+    if (x > 490 && x < 790 && y > 540 && y < 610) { sfx.click(); resetGame(); }
+    return;
   }
-
-  function drawGameOver() {
-    ctx.fillStyle = 'rgba(43,26,18,0.78)';
-    ctx.fillRect(0, 0, W, H);
-    Art.drawCircleImage(ctx, 'chef', W / 2, 150, 70);
-    ctx.fillStyle = '#ffd93c';
-    ctx.font = 'bold 56px "Trebuchet MS", sans-serif';
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText('SHIFT SELESAI!', W / 2, 260);
-    var K = game.kitchen, B = game.board;
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 30px "Trebuchet MS", sans-serif';
-    ctx.fillText('Koin: $' + K.coins, W / 2, 330);
-    ctx.font = '24px "Trebuchet MS", sans-serif';
-    ctx.fillText('Pesanan tersaji: ' + B.servedCount + '   ·   Pelanggan kabur: ' + B.lostCount, W / 2, 375);
-    ctx.fillText('Kombo terbaik: x' + K.bestCombo, W / 2, 410);
-    var verdict = K.coins >= 150 ? 'Koki bintang lima! Dapur ini milikmu.' :
-      K.coins >= 80 ? 'Shift yang solid. Besok lebih cepat lagi!' :
-      'Dapur masih berantakan — coba lagi, chef!';
-    ctx.fillStyle = '#ffe9b8'; ctx.font = 'italic 22px "Trebuchet MS", sans-serif';
-    ctx.fillText(verdict, W / 2, 460);
-    ctx.fillStyle = '#2ecc71';
-    Art.rr(ctx, W / 2 - 150, 510, 300, 56, 28); ctx.fill();
-    ctx.fillStyle = '#fff'; ctx.font = 'bold 24px "Trebuchet MS", sans-serif';
-    ctx.fillText('↻  MAIN LAGI  (R)', W / 2, 539);
+  if (G.mode === 'gameover') {
+    if (x > 490 && x < 790 && y > 430 && y < 494) { sfx.click(); resetGame(); }
+    return;
   }
-
-  function render() {
-    ctx.clearRect(0, 0, W, H);
-    if (game.state === 'title') {
-      drawBackground();
-      drawStations();
-      drawTitle();
+  if (G.mode === 'kitchen') {
+    // serve at the pass
+    if (G.readyPlate && x > G.readyPlate._x && x < G.readyPlate._x + G.readyPlate._w &&
+        y > G.readyPlate._y && y < G.readyPlate._y + G.readyPlate._h) {
+      servePlate(G, G.now);
       return;
     }
-    drawBackground();
-    drawStations();
-    drawOrderBoard();
-    drawHud();
-    drawChefAndEffects();
-    drawServeFlash();
-    if (game.state === 'paused') drawPaused();
-    if (game.state === 'over') drawGameOver();
-  }
-
-  function loop(t) {
-    var dt = Math.min(0.05, (t - game.last) / 1000 || 0.016);
-    game.last = t;
-    update(dt);
-    render();
-    requestAnimationFrame(loop);
-  }
-
-  // Headless smoke test (?selftest=1): drives the real grab/chop/grill/
-  // assemble/serve path synchronously and writes PASS/FAIL into the DOM.
-  function runSelfTest() {
-    var R = [];
-    function ck(n, c) { R.push((c ? 'PASS ' : 'FAIL ') + n); }
-    try {
-      startGame();
-      var K = game.kitchen, B = game.board;
-      B.tickets = [{ id: 1, recipe: Recipes.RECIPES[0], customer: 0, patience: 40, maxPatience: 46, bornAt: 0, flash: 0, served: false, lost: false }];
-      B.spawnTimer = 9999;
-      K.interact({ id: 'crates', bin: 'bun' }, Date.now());
-      ck('grab bun', !!(K.carrying && K.carrying.kind === 'bun'));
-      K.interact({ id: 'assembly' }, Date.now());
-      ck('plate has bun', K.plate.length === 1 && K.plate[0] === 'bun');
-      K.interact({ id: 'crates', bin: 'patty' }, Date.now());
-      ck('grab patty raw', !!(K.carrying && K.carrying.state === 'raw'));
-      K.interact({ id: 'grill' }, Date.now());
-      ck('patty on grill', !!K.grill.item);
-      for (var i = 0; i < 50; i++) K.update(0.1, {}, Date.now());
-      ck('patty grilled', K.grill.done === true);
-      K.interact({ id: 'grill' }, Date.now());
-      ck('pick grilled patty', !!(K.carrying && K.carrying.state === 'ready'));
-      K.interact({ id: 'assembly' }, Date.now());
-      ck('plate has patty', K.plate.indexOf('patty') !== -1);
-      K.interact({ id: 'crates', bin: 'lettuce' }, Date.now());
-      K.interact({ id: 'board' }, Date.now());
-      ck('chopping started', K.chop.item === 'lettuce' && K.chop.active);
-      for (var j = 0; j < 15; j++) K.update(0.1, {}, Date.now());
-      ck('lettuce chopped+carried', !!(K.carrying && K.carrying.kind === 'lettuce' && K.carrying.state === 'ready'));
-      K.interact({ id: 'assembly' }, Date.now());
-      ck('plate complete classic', !!Recipes.findRecipeForPlate(K.plate));
-      K.interact({ id: 'assembly' }, Date.now());
-      ck('carrying plate', !!(K.carrying && K.carrying.plate));
-      var coinsBefore = K.coins;
-      K.interact({ id: 'pass' }, Date.now());
-      ck('served for coins', K.coins > coinsBefore && B.servedCount === 1);
-      ck('combo 1', K.combo === 1);
-      K.interact({ id: 'crates', bin: 'cheese' }, Date.now());
-      K.interact({ id: 'assembly' }, Date.now());
-      K.interact({ id: 'assembly' }, Date.now());
-      K.interact({ id: 'pass' }, Date.now());
-      ck('wrong dish rejected', K.combo === 0 && K.carrying !== null);
-    } catch (err) {
-      R.push('ERROR ' + err.message);
+    // click a ticket → cook it
+    for (const t of G.tickets) {
+      if ((t.state === 'waiting') && t._x !== undefined && x > t._x && x < t._x + t._w && y > t._y && y < t._y + t._h) {
+        startCooking(G, t);
+        return;
+      }
     }
-    var pre = document.createElement('pre');
-    pre.id = 'selftest';
-    pre.textContent = R.join('\n');
-    document.body.appendChild(pre);
-    document.title = R.join(' | ');
+    // walk the chef
+    G.chef.tx = x; G.chef.ty = y;
+    return;
   }
+  if (G.mode === 'step') stepPointerDown(G, x, y);
+}
 
-  Art.loadAll(function () {
-    Shots.applyShot(game);
-    if (new URLSearchParams(window.location.search).get('selftest')) runSelfTest();
-    requestAnimationFrame(loop);
-  });
-  // Fallback if images fail: start anyway after a short wait.
-  setTimeout(function () {
-    if (!game.last) { Shots.applyShot(game); requestAnimationFrame(loop); }
-  }, 2500);
-})();
+function onPointerMove(e) {
+  if (G.mode !== 'step') return;
+  const { x, y } = canvasPos(e);
+  stepPointerMove(G, x, y);
+}
+
+function onPointerUp() {
+  if (G.mode === 'step') stepPointerUp(G);
+}
+
+function onKeyDown(e) {
+  const k = e.key.toLowerCase();
+  if (k === 'm') { G.muted = !G.muted; return; }
+  G.keys.add(k);
+  if (G.mode === 'step') stepKeyDown(G, k);
+  if (k === 'p' && (G.mode === 'kitchen' || G.mode === 'step')) {
+    G.frozen = !G.frozen;
+  }
+  if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' '].includes(k)) e.preventDefault();
+}
+
+function onKeyUp(e) {
+  G.keys.delete(e.key.toLowerCase());
+}
+
+async function init() {
+  canvas = document.getElementById('game');
+  ctx = canvas.getContext('2d');
+  await loadImages();
+  canvas.addEventListener('pointerdown', onPointerDown);
+  canvas.addEventListener('pointermove', onPointerMove);
+  window.addEventListener('pointerup', onPointerUp);
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+  const params = new URLSearchParams(location.search);
+  const shot = params.get('shot');
+  const selftest = params.get('selftest');
+  if (shot) applyShot(G, shot, resetGame, startCooking);
+  if (selftest) {
+    document.title = 'SELFTEST RUNNING';
+    await runSelfTest(G, resetGame, startCooking);
+  }
+  requestAnimationFrame(loop);
+}
+
+init();
